@@ -1,0 +1,150 @@
+---
+title: "Why deliveries are late, and what to promise instead"
+subtitle: "A statistical root-cause analysis of 172,765 delivered order lines, in R"
+author: "Nagaraj Gireppa Kanni"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    css: docs/style.css
+    includes:
+      in_header: docs/header.html
+    code_folding: hide
+    toc: true
+    toc_float: false
+    df_print: kable
+params:
+  data: "data/DataCoSupplyChainDataset.csv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.2, dpi = 144, fig.retina = 1)
+suppressPackageStartupMessages({ library(data.table); library(ggplot2); library(scales); library(knitr) })
+invisible(Sys.setlocale("LC_CTYPE", "C.UTF-8"))
+source("R/analysis.R")
+INK <- "#18222c"; INK3 <- "#6c7a87"; RULE <- "#dde3e8"; BLUE <- "#1f6fbf"; ORANGE <- "#c2531c"
+theme_set(theme_minimal(base_size = 12) + theme(
+  text = element_text(colour = INK), axis.text = element_text(colour = INK3), panel.grid.minor = element_blank(),
+  panel.grid.major = element_line(colour = RULE, linewidth = .4), plot.title.position = "plot",
+  plot.background = element_rect(fill = "#f6f7f8", colour = NA), legend.position = "top"))
+pct <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+d <- load_orders(params$data)
+o <- d[, .(late = late[1], mode = mode[1], promised = promised[1], actual = actual[1], week = week[1],
+           Market = Market[1], segment = Customer.Segment[1], weekday = weekday[1], payment = Type[1],
+           lines = .N, value = sum(Order.Item.Total), lates_in_order = uniqueN(late)), by = Order.Id]
+```
+
+```{r numbers, include=FALSE}
+overall <- mean(d$late)
+by_mode <- d[, .(lines = .N, promised = promised[1], mean_actual = mean(actual), late = mean(late)), by = mode][order(mode)]
+fc <- by_mode[mode == "First Class"]; std <- by_mode[mode == "Standard Class"]
+vars <- c(`Shipping mode` = "mode", Market = "Market", `Customer segment` = "Customer.Segment",
+          Department = "Department.Name", `Order weekday` = "weekday", `Payment type` = "Type")
+assoc <- rbindlist(lapply(names(vars), function(n) { a <- assoc_test(d[[vars[[n]]]], d$late)
+  data.table(factor = n, cramers_v = a$cramers_v, chi_sq = a$statistic, df = a$df, p_value = a$p_value) }))[order(-cramers_v)]
+pc_line <- p_chart(d$late, d$week); pc_order <- p_chart(o$late, o$week)
+gof <- d[mode != "First Class", { g <- uniform_gof(actual); .(range = paste(min(g$levels), "to", max(g$levels)), p_value = g$p_value, max_gap = g$max_share_gap) }, by = mode]
+```
+
+## The short answer
+
+`r pct(overall)` of delivered order lines arrived later than promised. **The shipping mode decides it.** First Class is promised in `r fc$promised` day and always takes `r fc$mean_actual`, so `r pct(fc$late, 0)` of it is late. Standard Class is promised in `r std$promised` days and takes `r sprintf("%.1f", std$mean_actual)` on average, so `r pct(std$late)` is late. Market, customer segment, department, weekday and payment type each explain essentially none of it (Cramér's V below 0.01).
+
+The fix is in the promise, not the warehouse: the table at the end gives the promise per mode that would hit 95% on time.
+
+```{r fig-mode, fig.height=3.2}
+ggplot(by_mode, aes(late, reorder(mode, late))) +
+  geom_col(fill = ORANGE, width = .55) +
+  geom_text(aes(label = pct(late)), hjust = -.15, colour = INK, size = 3.6) +
+  scale_x_continuous(labels = percent, limits = c(0, 1.12), expand = c(0, 0)) +
+  labs(x = "Share of order lines delivered late", y = NULL, title = "Late delivery rate by shipping mode")
+```
+
+## Which factors are associated with lateness
+
+A chi-square test of independence was run for each factor against the late flag. Cramér's V gives the strength of the association on a 0 to 1 scale, which matters more than the p-value at this sample size.
+
+```{r assoc-table}
+kable(assoc[, .(Factor = factor, `Cramér's V` = sprintf("%.3f", cramers_v), `Chi-square` = format(round(chi_sq), big.mark = ","),
+                df, `p-value` = ifelse(p_value < 1e-4, "< 0.0001", sprintf("%.3f", p_value)))], align = "lrrrr")
+```
+
+Shipping mode has a V of `r sprintf("%.2f", assoc[factor == "Shipping mode", cramers_v])`, a strong association. No other factor reaches 0.01 or is significant at the 5% level.
+
+### Does anything add to shipping mode? A logistic regression
+
+To check whether the other factors matter *together*, two logistic regressions were fitted at order level on a 70% training split: one with shipping mode only and one adding market, segment, weekday, payment type, number of lines and order value. First Class is left out because every First Class order is late (perfect separation).
+
+```{r logit}
+set.seed(42)
+m <- o[mode != "First Class"]; m[, mode := droplevels(mode)]
+idx <- sample(nrow(m), floor(.7 * nrow(m))); tr <- m[idx]; te <- m[-idx]
+f0 <- glm(late ~ mode, binomial, tr)
+f1 <- glm(late ~ mode + Market + segment + weekday + payment + lines + log1p(value), binomial, tr)
+lrt <- anova(f0, f1, test = "LRT")
+res <- data.table(Model = c("Shipping mode only", "Mode + 6 business factors"),
+                  `Holdout AUC` = sprintf("%.3f", c(auc(te$late, predict(f0, te)), auc(te$late, predict(f1, te)))),
+                  AIC = format(round(c(AIC(f0), AIC(f1))), big.mark = ","))
+kable(res, align = "lrr")
+```
+
+The extra factors change holdout AUC by `r sprintf("%+.3f", auc(te$late, predict(f1, te)) - auc(te$late, predict(f0, te)))` and the likelihood-ratio test gives p = `r sprintf("%.2f", lrt[2, "Pr(>Chi)"])` for `r lrt[2, "Df"]` extra parameters. Once shipping mode is known, nothing else in the data predicts lateness.
+
+## Is the process stable over time?
+
+A p-chart tracks the weekly late rate against 3-sigma control limits. **The unit of analysis matters here.**
+
+```{r pchart, fig.height=3.8}
+pp <- rbind(pc_line[, .(group, p, center, lcl, ucl, out, unit = sprintf("Order lines: %d of %d weeks out of control", sum(out), .N))],
+            pc_order[, .(group, p, center, lcl, ucl, out, unit = sprintf("Orders: %d of %d weeks out of control", sum(out), .N))])
+ggplot(pp, aes(group, p)) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), fill = BLUE, alpha = .10) +
+  geom_line(colour = BLUE, linewidth = .5) + geom_hline(aes(yintercept = center), colour = INK3, linewidth = .3) +
+  geom_point(data = pp[out == TRUE], colour = ORANGE, size = 2) +
+  facet_wrap(~unit, ncol = 1) + scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "Late share", title = "Weekly late rate with 3-sigma control limits") +
+  theme(strip.text = element_text(hjust = 0, colour = INK, face = "bold"))
+```
+
+Charted by order line, `r sum(pc_line$out)` of `r nrow(pc_line)` weeks fall outside the limits, which looks like an unstable process. But every line in an order shares the same shipping mode and the same outcome (`r pct(mean(o$lates_in_order > 1), 0)` of orders have mixed outcomes), so lines are not independent and the limits are too narrow. Charted by order, `r sum(pc_order$out)` of `r nrow(pc_order)` weeks `r ifelse(sum(pc_order$out) == 1, "falls", "fall")` outside, about what chance alone produces (`r sprintf("%.1f", nrow(pc_order) * 0.0027)` expected). **The process is stable; the line-level alarms were false.**
+
+## How actual shipping days are distributed
+
+```{r days, fig.height=3.6}
+dd <- d[, .N, by = .(mode, actual)][, share := N / sum(N), by = mode]
+cut_pos <- d[, .(x = promised[1] - min(actual) + 1.5), by = mode]  # boundary just after the promised day, in facet positions
+ggplot(dd, aes(factor(actual), share)) + geom_col(fill = BLUE, width = .6) +
+  geom_vline(data = cut_pos, aes(xintercept = x), colour = ORANGE, linetype = 2) +
+  facet_wrap(~mode, nrow = 1, scales = "free_x") + scale_y_continuous(labels = percent) +
+  labs(x = "Actual shipping days", y = "Share of lines", title = "Actual shipping days by mode (dashed line: promise; bars right of it are late)")
+```
+
+Within each mode, actual days are spread almost evenly across a fixed range. A chi-square goodness-of-fit test against a uniform distribution:
+
+```{r gof}
+kable(gof[, .(Mode = mode, `Actual days` = range, `Largest gap from uniform` = pct(max_gap, 2),
+              `p-value` = ifelse(p_value < 1e-4, "< 0.0001", sprintf("%.3f", p_value)))], align = "llrr")
+```
+
+Every mode is within about 2 percentage points of perfectly uniform; with this many rows, even tiny gaps reach significance. Real carriers do not deliver this evenly, which suggests the dataset's delivery times were simulated.
+
+<p class="caveat">Read every finding here as a demonstration of method on a public, likely synthetic dataset, not as a claim about a real supply chain.</p>
+
+## What to promise instead
+
+For each mode, the table shows the current promise, its on-time rate, and the smallest whole-day promise that would have met an 80% or a 95% on-time target, based on the actual days observed.
+
+```{r promise}
+rec <- d[, .(`Current promise (days)` = promised[1], `On time today` = pct(1 - mean(late)),
+             `Promise for 80%` = promise_for_target(actual, .80), `Promise for 95%` = promise_for_target(actual, .95),
+             `On time at 95% promise` = pct(mean(actual <= promise_for_target(actual, .95)))), by = .(Mode = mode)][order(Mode)]
+kable(rec, align = "lrrrrr")
+```
+
+**Recommendation:** either quote Second Class at `r rec[Mode == "Second Class"][["Promise for 95%"]]` days instead of `r rec[Mode == "Second Class"][["Current promise (days)"]]`, or keep the promise and change how the mode is fulfilled. Second Class takes as long as Standard Class but promises half the time, so it is the largest and most fixable gap. First Class needs a `r rec[Mode == "First Class"][["Promise for 95%"]]`-day promise or a carrier that can deliver next day.
+
+## Method and reproducibility
+
+- **Data:** DataCo Smart Supply Chain for Big Data Analysis (Constante, Silva and Pereira, 2019, Mendeley Data, CC BY 4.0). `r format(nrow(d), big.mark = ",")` delivered order lines in `r format(nrow(o), big.mark = ",")` orders, excluding shipping-canceled lines. Customer personal fields are dropped on load.
+- **Late** means actual shipping days greater than scheduled days.
+- **Tools:** R `r paste(R.version$major, R.version$minor, sep = ".")`, data.table, ggplot2, base `stats` (chisq.test, glm), and R Markdown. The helper functions in `R/analysis.R` are covered by testthat tests.
+- **Build:** a GitHub Actions workflow downloads the pinned data file, runs the tests, renders this report and publishes it to GitHub Pages.

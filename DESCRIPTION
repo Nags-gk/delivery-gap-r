@@ -1,0 +1,11 @@
+Package: deliverygap
+Title: Delivery SLA Gap Analysis in R
+Version: 0.1.0
+Authors@R: person("Nagaraj", "Gireppa Kanni", role = c("aut", "cre"))
+Description: Statistical root-cause analysis of late deliveries on the DataCo supply chain dataset:
+    chi-square tests with Cramer's V, logistic regression with holdout AUC, p-charts, goodness-of-fit
+    tests, and a promise-setting recommendation, rendered as an R Markdown report.
+License: MIT
+Encoding: UTF-8
+Imports: data.table, ggplot2, scales, knitr, rmarkdown
+Suggests: testthat

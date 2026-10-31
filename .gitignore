@@ -1,0 +1,6 @@
+data/
+_site/
+.Rhistory
+.RData
+*_cache/
+*_files/
